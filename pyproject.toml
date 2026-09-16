@@ -36,6 +36,15 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "mujoco>=3.3.0,<3.10",
+    "gymnasium>=0.29",
+    "numba>=0.49.1",
+    "lxml",
+    "pygame",
+    "pyyaml",
+    "tianshou==0.4.10",
+    "hidapi",
+    "pynput",
 ]
 
 
@@ -59,7 +68,7 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "av==14.0.1", "numpy==2.2.5", "tianshou==0.4.10"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

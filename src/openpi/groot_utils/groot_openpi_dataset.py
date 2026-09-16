@@ -13,7 +13,6 @@ import pandas as pd
 import cv2  # Add OpenCV for video frame extraction
 
 import openpi.models.model as _model
-import openpi.training.config as _config
 import openpi.transforms as _transforms
 import openpi.shared.normalize as _normalize
 

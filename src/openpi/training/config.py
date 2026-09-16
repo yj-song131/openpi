@@ -574,17 +574,20 @@ class LeRobotRobocasaDataConfig(DataConfigFactory):
         # Fallback: if norm_stats not found via assets/repo meta, combine from all data_dirs
         fallback_norm_stats = None
         if base.norm_stats is None and self.data_dirs and len(self.data_dirs) > 0:
-            if len(self.data_dirs) == 1:
-                d = self.data_dirs[0]
-                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
-                if norm_stats is not None:
-                    fallback_norm_stats = norm_stats
-                    logging.info(f"Loaded norm stats from local data dir: {d}")
-            else:
-                norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(self.data_dirs)
-                if norm_stats is not None:
-                    fallback_norm_stats = norm_stats
-                    logging.info(f"Loaded combined norm stats from {len(self.data_dirs)} data dirs")
+            try:
+                if len(self.data_dirs) == 1:
+                    d = self.data_dirs[0]
+                    norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_dataset(d)
+                    if norm_stats is not None:
+                        fallback_norm_stats = norm_stats
+                        logging.info(f"Loaded norm stats from local data dir: {d}")
+                else:
+                    norm_stats = _groot_openpi_dataset._load_norm_stats_from_groot_mixture_dataset(self.data_dirs)
+                    if norm_stats is not None:
+                        fallback_norm_stats = norm_stats
+                        logging.info(f"Loaded combined norm stats from {len(self.data_dirs)} data dirs")
+            except FileNotFoundError as e:
+                logging.info(f"Data dirs not available for norm stats ({e}); will load from checkpoint assets.")
  
         return dataclasses.replace(
             base,

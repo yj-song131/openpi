@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+import pickle
 import imageio
 from datetime import datetime
 import numpy as np
@@ -37,14 +38,28 @@ class Args:
 
     split: str = "pretrain"
     num_trials: int = 50  # Number of rollouts per task
-    task_set: list = None
+    # Task selection: either a TASK_SET_REGISTRY key or an explicit comma-separated list of task names.
+    task_set: str | None = None
+    tasks: str | None = None  # e.g. "TaskA,TaskB,TaskC"
+
+    # Original-paper-style evaluation: cycle through 5 fixed (layout, style) combos.
+    # When True, ignores split for layout selection and uses ORIG_EVAL_LAYOUTS below.
+    # num_trials should equal len(ORIG_EVAL_LAYOUTS) * episodes_per_layout.
+    eval_fixed_layouts: bool = False
+    episodes_per_layout: int = 5  # episodes per layout when eval_fixed_layouts=True
 
     #################################################################################################################
     # Utils
     #################################################################################################################
-    log_dir: str = None
+    log_dir: str | None = None
+    # When set, saves env_records/ flat under this root (SAFE-compatible).
+    # The serve_policy server's --record-dir should point to <rollout_root>/policy_records/.
+    rollout_root: str | None = None
+    # Offset added to task_id so different groups don't collide (e.g. val_unseen starts at 100).
+    task_id_offset: int = 0
 
     seed: int = 7  # Random Seed (for reproducibility)
+    episode_start: int = 0  # Start from this episode index (for parallel collection)
 
 
 def eval_main(args: Args) -> None:
@@ -59,11 +74,18 @@ def eval_main(args: Args) -> None:
     host = args.host
     port = args.port
 
-    all_env_names = TASK_SET_REGISTRY[args.task_soup]
+    if args.tasks is not None:
+        all_env_names = [t.strip() for t in args.tasks.split(",")]
+    elif args.task_set is not None:
+        all_env_names = TASK_SET_REGISTRY[args.task_set]
+    else:
+        raise ValueError("Provide --tasks or --task-set")
 
-    for env_name in all_env_names:
+    for local_idx, env_name in enumerate(all_env_names):
+        task_id = local_idx + args.task_id_offset
         eval_env(
             env_name,
+            task_id,
             split,
             log_dir,
             num_trials,
@@ -72,53 +94,93 @@ def eval_main(args: Args) -> None:
             host,
             port,
             args.seed,
+            rollout_root=args.rollout_root,
+            eval_fixed_layouts=args.eval_fixed_layouts,
+            episodes_per_layout=args.episodes_per_layout,
+            episode_start=args.episode_start,
         )
 
 
-def eval_env(env_name, split, log_dir, num_trials, resize_size, replan_steps, host, port, seed):
+# 5 (layout, style) pairs from the original robocasa evaluation protocol.
+ORIG_EVAL_LAYOUTS = [(1, 1), (2, 2), (4, 4), (6, 9), (7, 10)]
+
+
+def eval_env(env_name, task_id, split, log_dir, num_trials, resize_size, replan_steps, host, port, seed, rollout_root=None, eval_fixed_layouts=False, episodes_per_layout=5, episode_start=0):
     # set args based on task
     assert split in ["pretrain", "target"]
     horizon = get_task_horizon(env_name)
 
-    now = datetime.now()
-    now_formatted = now.strftime("%Y-%m-%d-%H-%M")
-    log_path = f"{log_dir}/evals_1.5/{split}/{env_name}/{now_formatted}"
-
-    for root, dirs, files in os.walk(os.path.dirname(log_path)):
-        if "stats.json" in files:
-            print(f"{env_name}/{split}, stats path exists, skipping.")
+    if rollout_root is not None:
+        # Flat SAFE-compatible layout: all tasks share one env_records/ dir.
+        env_records_dir = pathlib.Path(rollout_root) / "env_records"
+        env_records_dir.mkdir(parents=True, exist_ok=True)
+        # Check if this task already has episodes recorded (resume-safe).
+        existing = list(env_records_dir.glob(f"task{task_id}--ep*--succ*.pkl"))
+        if len(existing) >= num_trials - episode_start:
+            print(f"[skip] task_id={task_id} ({env_name}) already has {len(existing)} episodes.")
             return
+        log_path = str(pathlib.Path(rollout_root) / "logs" / f"{env_name}")
+        pathlib.Path(log_path).mkdir(parents=True, exist_ok=True)
+    else:
+        assert log_dir is not None, "Provide --log-dir or --rollout-root"
+        now = datetime.now()
+        now_formatted = now.strftime("%Y-%m-%d-%H-%M")
+        log_path = f"{log_dir}/evals_1.5/{split}/{env_name}/{now_formatted}"
 
-    pathlib.Path(log_path).mkdir(parents=True, exist_ok=True)
+        for root, dirs, files in os.walk(os.path.dirname(log_path)):
+            if "stats.json" in files:
+                print(f"{env_name}/{split}, stats path exists, skipping.")
+                return
+
+        pathlib.Path(log_path).mkdir(parents=True, exist_ok=True)
+        # SAFE-compatible subdirectories
+        env_records_dir = pathlib.Path(log_path) / "env_records"
+        env_records_dir.mkdir(parents=True, exist_ok=True)
 
     client = _websocket_client_policy.WebsocketClientPolicy(host, port)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
     # Get task
-    env = gym.make(f"robocasa/{env_name}", split=split, seed=seed)
+    if eval_fixed_layouts:
+        # Original-paper eval: 5 fixed (layout, style) combos, cycled per episode.
+        env = gym.make(
+            f"robocasa/{env_name}",
+            split=None,
+            layout_and_style_ids=ORIG_EVAL_LAYOUTS,
+            obj_instance_split="target",
+            seed=seed,
+        )
+    else:
+        env = gym.make(f"robocasa/{env_name}", split=split, seed=seed)
+    task_description = env_name  # use env name as task description
 
     # Start episodes
     task_episodes, task_successes = 0, 0
-    for episode_idx in tqdm.tqdm(range(num_trials)):
+    for episode_idx in tqdm.tqdm(range(episode_start, num_trials)):
 
-        # Reset environment
+        # Reset environment — for fixed-layout eval, pin the layout before reset.
+        if eval_fixed_layouts:
+            layout = ORIG_EVAL_LAYOUTS[episode_idx // episodes_per_layout]
+            env.env.layout_and_style_ids = [layout]
         obs, info = env.reset()
         task_lang = obs["annotation.human.task_description"]
+        task_description = task_lang  # use actual language annotation
         action_plan = collections.deque()
 
         # Setup
         t = 0
         replay_images = []
+        model_infer_times = 0  # count how many times the policy was queried
+        infer_timestep = 0     # timestep index for policy record naming
 
         logging.info(f"Starting episode {task_episodes+1}...")
         while t < horizon:
             # Get preprocessed image
-            # IMPORTANT: rotate 180 degrees to match train preprocessing
             img = np.ascontiguousarray(obs["video.robot0_agentview_left"])
             wrist_img = np.ascontiguousarray(obs["video.robot0_eye_in_hand"])
             img_right = np.ascontiguousarray(obs["video.robot0_agentview_right"])
-            
+
             img = image_tools.convert_to_uint8(
                 image_tools.resize_with_pad(img, resize_size, resize_size)
             )
@@ -141,13 +203,16 @@ def eval_env(env_name, split, log_dir, num_trials, resize_size, replan_steps, ho
                     axis=0,
                 )
 
-                # Prepare observations dict
+                # Prepare observations dict — include run metadata for SAFE policy record naming
                 element = {
                     "observation/image": img,
                     "observation/wrist_image": wrist_img,
                     "observation/right_image": img_right,
                     "observation/state": state,
                     "prompt": task_lang,
+                    "run/task_id": task_id,
+                    "run/episode_idx": episode_idx,
+                    "run/timestep": infer_timestep,
                 }
 
                 # Query model to get action
@@ -156,6 +221,8 @@ def eval_env(env_name, split, log_dir, num_trials, resize_size, replan_steps, ho
                     len(action_chunk) >= replan_steps
                 ), f"We want to replan every {replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
                 action_plan.extend(action_chunk[: replan_steps])
+                model_infer_times += 1
+                infer_timestep += 1
 
             action = action_plan.popleft()
             action = convert_action(action)
@@ -180,31 +247,46 @@ def eval_env(env_name, split, log_dir, num_trials, resize_size, replan_steps, ho
         task_episodes += 1
         total_episodes += 1
 
-        # Save a replay video of the episode
-        suffix = "success" if done else "failure"
-        imageio.mimwrite(
-            pathlib.Path(log_path) / f"rollout_{episode_idx}_{suffix}.mp4",
-            [np.asarray(x) for x in replay_images],
-            fps=20,
-        )
+        # Save mp4 in SAFE-compatible naming under env_records/
+        succ_int = 1 if done else 0
+        mp4_name = f"task{task_id}--ep{episode_idx}--succ{succ_int}.mp4"
+        mp4_path = env_records_dir / mp4_name
+        imageio.mimwrite(mp4_path, [np.asarray(x) for x in replay_images], fps=20)
+
+        # Save env_record pkl in SAFE-compatible format
+        env_record = {
+            "task_suite_name": "robocasa365",
+            "task_id": task_id,
+            "task_description": task_description,
+            "episode_idx": episode_idx,
+            "episode_success": bool(done),
+            "mp4_path": str(mp4_path),
+            "model_infer_times": model_infer_times,
+            "replan_steps": replan_steps,
+            "end_step": t,
+        }
+        pkl_name = f"task{task_id}--ep{episode_idx}--succ{succ_int}.pkl"
+        with open(env_records_dir / pkl_name, "wb") as f:
+            pickle.dump(env_record, f)
 
         # Log current results
         logging.info(f"Success: {done}")
         logging.info(f"# episodes completed so far: {total_episodes}")
         logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
-        # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
     logging.info(f"[{env_name}] Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"[{env_name}] Total episodes: {total_episodes}")
     print()
+    stats = {
+        "env_name": env_name,
+        "task_id": task_id,
+        "num_episodes": total_episodes,
+        "success_rate": float(total_successes) / float(total_episodes),
+    }
     with open(os.path.join(log_path, "stats.json"), "w") as f:
-        stats = {
-            "num_episodes": total_episodes,
-            "success_rate": float(total_successes) / float(total_episodes),
-        }
         json.dump(stats, f, indent=4)
 
     # close and delete the env

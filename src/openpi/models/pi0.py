@@ -221,7 +221,7 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-    ) -> _model.Actions:
+    ) -> tuple[_model.Actions, at.Float[at.Array, "num_steps b ah hidden"]]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -236,7 +236,7 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
+        def step(carry, _):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
@@ -266,14 +266,13 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            # pre_velocity: hidden states before action projection, shape (b, action_horizon, hidden_dim)
+            pre_velocity = suffix_out[:, -self.action_horizon :]
+            v_t = self.action_out_proj(pre_velocity)
 
-            return x_t + dt * v_t, time + dt
+            return (x_t + dt * v_t, time + dt), pre_velocity
 
-        def cond(carry):
-            x_t, time = carry
-            # robust to floating-point error
-            return time >= -dt / 2
-
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+        # Use scan instead of while_loop to collect intermediate hidden states (pre_velocity)
+        # pre_velocities shape: (num_steps, b, action_horizon, hidden_dim)
+        (x_0, _), pre_velocities = jax.lax.scan(step, (noise, 1.0), None, length=num_steps)
+        return x_0, pre_velocities

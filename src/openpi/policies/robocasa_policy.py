@@ -124,4 +124,8 @@ class RobocasaOutputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :12])}
+        result = {"actions": np.asarray(data["actions"][:, :12])}
+        # Pass through pre_velocity so PolicyRecorder can save it for SAFE training.
+        if "pre_velocity" in data:
+            result["pre_velocity"] = data["pre_velocity"]
+        return result

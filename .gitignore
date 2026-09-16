@@ -171,3 +171,8 @@ cython_debug/
 # added by Soroush
 checkpoints
 MUJOCO_LOG.TXT
+
+# Auth tokens
+.hf_token
+.*_token
+.*_api_key

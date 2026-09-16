@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 import logging
 import pathlib
+import pickle
 import time
 from typing import Any, TypeAlias
 
@@ -89,15 +90,30 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+        sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        # sample_actions returns (actions, pre_velocity) for pi0, or just actions for other models.
+        # pre_velocity has shape (num_steps, batch, action_horizon, hidden_dim) — batch is at dim 1,
+        # so it must be handled separately from other outputs (which have batch at dim 0).
+        if isinstance(sample_result, tuple):
+            actions, pre_velocity = sample_result
+            outputs = {
+                "state": inputs["state"],
+                "actions": actions,
+            }
+        else:
+            pre_velocity = None
+            outputs = {
+                "state": inputs["state"],
+                "actions": sample_result,
+            }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        # Squeeze batch dim (dim 1) from pre_velocity: (num_steps, batch, H, D) -> (num_steps, H, D)
+        if pre_velocity is not None:
+            outputs["pre_velocity"] = np.asarray(pre_velocity[:, 0, ...])
 
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
@@ -111,7 +127,13 @@ class Policy(BasePolicy):
 
 
 class PolicyRecorder(_base_policy.BasePolicy):
-    """Records the policy's behavior to disk."""
+    """Records the policy's behavior to disk in SAFE-compatible pkl format.
+
+    Saves one file per inference call named:
+        --task_{task_id}--ep_{episode_idx}--t_{timestep}--meta.pkl
+    Each pkl contains: actions, pre_velocity, state, and raw obs fields.
+    Requires obs to contain run/task_id, run/episode_idx, run/timestep keys.
+    """
 
     def __init__(self, policy: _base_policy.BasePolicy, record_dir: str):
         self._policy = policy
@@ -125,11 +147,24 @@ class PolicyRecorder(_base_policy.BasePolicy):
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         results = self._policy.infer(obs)
 
-        data = {"inputs": obs, "outputs": results}
-        data = flax.traverse_util.flatten_dict(data, sep="/")
+        task_id = int(obs.get("run/task_id", 0))
+        episode_idx = int(obs.get("run/episode_idx", 0))
+        timestep = int(obs.get("run/timestep", self._record_step))
 
-        output_path = self._record_dir / f"step_{self._record_step}"
+        record = {
+            "actions": results["actions"],
+            "state": results.get("state"),
+        }
+        if "pre_velocity" in results:
+            record["pre_velocity"] = results["pre_velocity"]
+
+        fname = f"--task_{task_id}--ep_{episode_idx}--t_{timestep}--meta.pkl"
+        output_path = self._record_dir / fname
+        with open(output_path, "wb") as f:
+            pickle.dump(record, f)
+
         self._record_step += 1
-
-        np.save(output_path, np.asarray(data))
+        # Strip pre_velocity before returning: client doesn't need it, and bfloat16
+        # is not supported by msgpack serialization used in the websocket transport.
+        results.pop("pre_velocity", None)
         return results

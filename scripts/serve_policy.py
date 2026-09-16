@@ -5,6 +5,9 @@ import socket
 
 import tyro
 
+# Must be imported before openpi.training.config to avoid JAX/mujoco init-order segfault.
+import openpi.groot_utils.groot_openpi_dataset as _groot_openpi_dataset  # noqa: F401
+
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
@@ -50,6 +53,9 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+    # Directory to save policy records (used when --record is set).
+    # Should match <log_dir>/policy_records so SAFE can find them alongside env_records.
+    record_dir: str = "policy_records"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -102,7 +108,7 @@ def main(args: Args) -> None:
 
     # Record the policy's behavior.
     if args.record:
-        policy = _policy.PolicyRecorder(policy, "policy_records")
+        policy = _policy.PolicyRecorder(policy, args.record_dir)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
